@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <bits/getopt_core.h>
@@ -43,8 +44,10 @@
 #define LAB_BROADCAST       (in_addr_t)         0xC0A818FF
 #define HOME_BROADCAST      (in_addr_t)         0xC0A801FF
 #define DEFAULT_TFTP_PORT   (unsigned short)    69
+#define SOCK_TIMEOUT_US     (int)               500000
 
 /* TFTP Defines */
+#define MAX_FILE_NAME       (int)               255
 #define MAX_BLOCKS          (int)               65535
 #define MAX_BLOCK_SIZE      (int)               512
 #define TFTP_MODE           (char*)             "octet"
@@ -77,8 +80,8 @@ int main(int argc, char** argv)
     server.sin_port = htons(DEFAULT_TFTP_PORT);
 
     printf(ESC_WHITE_TXT);
-    
-    char* filename;
+
+    char* filename = calloc(MAX_FILE_NAME, sizeof(char));
 
 	int sock; // socket descriptor
 
@@ -111,51 +114,92 @@ int main(int argc, char** argv)
 	}
 
     // ready to go
-	printf("Connecting to TFTP server on port: %d\n",ntohs(server.sin_port));
+	printf("Connecting to TFTP server on port: %d\n", ntohs(server.sin_port));
 	
 	// for UDP, we want IP protocol domain (AF_INET)
 	// and UDP transport type (SOCK_DGRAM)
 	// no alternate protocol - 0, since we have already specified IP
+
+    struct timeval sockTimeout;
+    sockTimeout.tv_sec = 0;
+    sockTimeout.tv_usec = SOCK_TIMEOUT_US;
 	
-	if ((sock = socket( AF_INET, SOCK_DGRAM, 0 )) < 0) 
+	if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0 //||
+        //(setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &sockTimeout,
+                    )//sizeof(sockTimeout)) < 0)) 
 	{
-		perror("Error on socket creation");
+		perror("Error on socket creation and configuration\n");
 		exit(1);
 	}
 
-    char* rrqBuffer = calloc(MAX_BLOCK_SIZE,sizeof(uint8_t));
-    char* receiveBuffer = calloc(MAX_BLOCK_SIZE,sizeof(uint8_t));
-    int rrqLength = 2+sizeof(filename)+sizeof(TFTP_MODE);
+    uint8_t* sendBuffer = calloc(MAX_BLOCK_SIZE,sizeof(uint8_t));
+    int sendLength = 2+strlen(filename)+1+strlen(TFTP_MODE)+1;
+    uint8_t* receiveBuffer = calloc(MAX_BLOCK_SIZE,sizeof(uint8_t));
+    FILE* receiveFile = NULL;
+    uint16_t currentBlock = 0;
     struct sockaddr_in from;
     socklen_t server_len = sizeof(server);
-    int sent;
-    int received;
+    int sent = 0;
+    int received = 0;
+    int retransmitAttempts = 0;
 
-    rrqBuffer[1] = TFTP_RRQ;
-    strcpy(rrqBuffer+2,filename);
-    strcpy(rrqBuffer+sizeof(filename),TFTP_MODE);
+    sendBuffer[1] = TFTP_RRQ;
+    strcpy(sendBuffer+2,filename);
+    strcpy(sendBuffer+strlen(filename)+3,TFTP_MODE);
 
-    sent = sendto(sock,rrqBuffer, rrqLength, 0,
+    sent = sendto(sock, sendBuffer, sendLength, 0,
                       (struct sockaddr *)&server, server_len);
 
     printf("Sent %d bytes to %s\n",sent,inet_ntoa(server.sin_addr));
+    printf("packet contained: %d%d %s %s\n", sendBuffer[0], sendBuffer[1],
+           sendBuffer+2, sendBuffer+strlen(filename)+3);
 
     do
     {
-        received = recvfrom(sock, receiveBuffer, MAX_BLOCK_SIZE, 0,
-                            (struct sockaddr *)&from, &server_len);
+        if((received = recvfrom(sock, receiveBuffer, MAX_BLOCK_SIZE, 0,
+                            (struct sockaddr *)&from, &server_len)) < 0)
+        {
+            if (retransmitAttempts <= 5)
+            {
+                printf("Respose Timeout: retransmitting\n");
+                if (retransmitAttempts != 0)
+                {
+                    sendBuffer[0] = 0;
+                    sendBuffer[1] = TFTP_ACK;
+                    memcpy(sendBuffer+2, currentBlock, sizeof(currentBlock));
+                    // sendBuffer[2] = (uint8_t) currentBlock >> 8;
+                    // sendBuffer[3] = (uint8_t) currentBlock;
+                    sendLength = 4;
+                }
+                sent = sendto(sock, sendBuffer, sendLength, 0,
+                              (struct sockaddr *)&server, server_len);
+            }
+            else
+            {
+                printf("Response Timeout: too many failed attempts\n");
+                fclose(receiveFile);
+                free(filename);
+                free(sendBuffer);
+                free(receiveBuffer);
+
+                exit(1);
+            }
+            
+        }
 
         // print info to console
 		printf("Received message from %s port %d\n",
 		       inet_ntoa(from.sin_addr), ntohs(from.sin_port));
 
-        if (received < 0)
-		{
-		    perror("Error receiving data");
-		}
-		else
-		{
-			switch (receiveBuffer[1])
+        server.sin_port = from.sin_port;
+
+        // if (received < 0)
+		// {
+		//     perror("Error receiving data");
+		// }
+		// else
+		// {
+			switch ((receiveBuffer[0]<<8)|receiveBuffer[1])
             {
             case TFTP_RRQ:
                 printf("%sRECEIVING RRQ NOT IMPLEMENTED IN THIS PROGRAM%s\n",
@@ -168,7 +212,41 @@ int main(int argc, char** argv)
                 break;
 
             case TFTP_DATA:
-                // TODO
+                if (receiveFile == NULL)
+                {
+                    receiveFile = fopen(filename, "a+");
+                }
+                if(fwrite(receiveBuffer+4, received-4, 1, receiveFile))
+                {
+                    sendBuffer[0] = 0;
+                    sendBuffer[1] = TFTP_ACK;
+                    memcpy(sendBuffer+2, currentBlock, sizeof(currentBlock));
+                    // sendBuffer[2] = (uint8_t) currentBlock >> 8;
+                    // sendBuffer[3] = (uint8_t) currentBlock;
+                    sendLength = 4;
+                    sent = sendto(sock, sendBuffer, sendLength, 0,
+                                  (struct sockaddr *)&server, server_len);
+
+                    printf("ACK contained: %d%d %d%d\n", sendBuffer[0],
+                           sendBuffer[1], sendBuffer[2], sendBuffer[3]);
+
+                    currentBlock++;
+
+                    printf("\r%s[", ESC_WHITE_TXT);
+                    for (int i = 0; i < MAX_BLOCKS/819; i++)
+                    {
+                        if (currentBlock/819 >= i)
+                        {
+                            printf("%s=%s", ESC_GREEN_TXT, ESC_WHITE_TXT);
+                        }
+                        else
+                        {
+                            printf("%s-%s", ESC_WHITE_TXT, ESC_WHITE_TXT);
+                        }                     
+                    }
+                    printf("%s]%s", ESC_WHITE_TXT, ESC_WHITE_TXT);
+                    
+                }
                 break;
 
             case TFTP_ACK:
@@ -178,7 +256,7 @@ int main(int argc, char** argv)
 
             case TFTP_ERROR:
                 printf("%sTFTP ERROR ", ESC_RED_TXT);
-                switch (receiveBuffer[3])
+                switch ((receiveBuffer[2]<<8)|receiveBuffer[3])
                 {
                 case TFTP_ERROR_NOTDIFF:
                     printf("See Error Message: ");
@@ -217,6 +295,13 @@ int main(int argc, char** argv)
                     break;
                 }
                 printf("%s%s\n", (receiveBuffer+2), ESC_WHITE_TXT);
+
+                fclose(receiveFile);
+                free(filename);
+                free(sendBuffer);
+                free(receiveBuffer);
+
+                exit(1);
                 break;
             
             default:
@@ -224,9 +309,21 @@ int main(int argc, char** argv)
                        ESC_WHITE_TXT);
                 break;
             }            
-        }
+        // }
 
-    } while (ntohl(server.sin_addr.s_addr) == (LAB_BROADCAST||HOME_BROADCAST||INADDR_BROADCAST));
+    } while (received >= MAX_BLOCK_SIZE);
+
+    printf("\r%s[", ESC_WHITE_TXT);
+    for (int i = 0; i < MAX_BLOCKS/819; i++)
+    {
+        printf("%s=%s", ESC_GREEN_TXT, ESC_WHITE_TXT);                   
+    }
+    printf("%s]%s", ESC_WHITE_TXT, ESC_WHITE_TXT);
+    
+    fclose(receiveFile);
+    free(filename);
+    free(sendBuffer);
+    free(receiveBuffer);
 
     // close socket
 	close(sock);
