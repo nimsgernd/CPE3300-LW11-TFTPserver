@@ -1,5 +1,10 @@
 // Simple tftp client
 // CPE 3300, Daniel Nimsgern
+//  
+// Honestly I had a really hard time with this lab. Every time I tried to
+// implement something there were several issues. The main hiccup I ran into
+// was missing bytes and repeated packets which was fixed by accounting for the
+// length of the header throughout the program and the ACK starts at 1 not 0.
 //
 // Build with gcc -o tftpclient tftpclient.c
 
