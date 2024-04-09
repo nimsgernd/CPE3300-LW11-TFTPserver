@@ -44,7 +44,7 @@
 #define LAB_BROADCAST       (in_addr_t)         0xC0A818FF
 #define HOME_BROADCAST      (in_addr_t)         0xC0A801FF
 #define DEFAULT_TFTP_PORT   (unsigned short)    69
-#define SOCK_TIMEOUT_US     (int)               500000
+#define SOCK_TIMEOUT_US     (int)               5000000
 
 /* TFTP Defines */
 #define MAX_FILE_NAME       (int)               255
@@ -107,7 +107,11 @@ int main(int argc, char** argv)
                 strcpy(filename,optarg);
                 break;
 			case 'h':
-				printf("wompwomp\n");
+				printf("\n");
+                printf("-h prints this help statement\n\n");
+                printf("-s is the IPv4 address of the TFTP server\n\n");
+                printf("-p override the TFTP server port (default: 69)\n\n");
+                printf("-f file name to download from the TFTP server\n\n");
 		        exit(1);
 				break;
 		}
@@ -124,19 +128,19 @@ int main(int argc, char** argv)
     sockTimeout.tv_sec = 0;
     sockTimeout.tv_usec = SOCK_TIMEOUT_US;
 	
-	if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0 //||
-        //(setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &sockTimeout,
-                    )//sizeof(sockTimeout)) < 0)) 
+	if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ||
+        (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &sockTimeout,
+                    sizeof(sockTimeout)) < 0)) 
 	{
 		perror("Error on socket creation and configuration\n");
 		exit(1);
 	}
 
-    uint8_t* sendBuffer = calloc(MAX_BLOCK_SIZE,sizeof(uint8_t));
+    uint8_t* sendBuffer = calloc(MAX_BLOCK_SIZE+4,sizeof(uint8_t));
     int sendLength = 2+strlen(filename)+1+strlen(TFTP_MODE)+1;
-    uint8_t* receiveBuffer = calloc(MAX_BLOCK_SIZE,sizeof(uint8_t));
+    uint8_t* receiveBuffer = calloc(MAX_BLOCK_SIZE+4,sizeof(uint8_t));
     FILE* receiveFile = NULL;
-    uint16_t currentBlock = 0;
+    uint16_t currentBlock = 1;
     struct sockaddr_in from;
     socklen_t server_len = sizeof(server);
     int sent = 0;
@@ -156,7 +160,7 @@ int main(int argc, char** argv)
 
     do
     {
-        if((received = recvfrom(sock, receiveBuffer, MAX_BLOCK_SIZE, 0,
+        if((received = recvfrom(sock, receiveBuffer, MAX_BLOCK_SIZE+4, 0,
                             (struct sockaddr *)&from, &server_len)) < 0)
         {
             if (retransmitAttempts <= 5)
@@ -166,13 +170,14 @@ int main(int argc, char** argv)
                 {
                     sendBuffer[0] = 0;
                     sendBuffer[1] = TFTP_ACK;
-                    memcpy(sendBuffer+2, currentBlock, sizeof(currentBlock));
-                    // sendBuffer[2] = (uint8_t) currentBlock >> 8;
-                    // sendBuffer[3] = (uint8_t) currentBlock;
+                    sendBuffer[2] = currentBlock >> 8;
+                    sendBuffer[3] = currentBlock & 0x00FF;
                     sendLength = 4;
                 }
                 sent = sendto(sock, sendBuffer, sendLength, 0,
                               (struct sockaddr *)&server, server_len);
+
+                retransmitAttempts++;
             }
             else
             {
@@ -188,17 +193,17 @@ int main(int argc, char** argv)
         }
 
         // print info to console
-		printf("Received message from %s port %d\n",
-		       inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+		// printf("\033[1A\n\rReceived message from %s port %d\n\033[1B",
+		//        inet_ntoa(from.sin_addr), ntohs(from.sin_port));
 
         server.sin_port = from.sin_port;
 
-        // if (received < 0)
-		// {
-		//     perror("Error receiving data");
-		// }
-		// else
-		// {
+        if (received < 0)
+		{
+		    perror("Error receiving data");
+		}
+		else
+		{
 			switch ((receiveBuffer[0]<<8)|receiveBuffer[1])
             {
             case TFTP_RRQ:
@@ -220,22 +225,22 @@ int main(int argc, char** argv)
                 {
                     sendBuffer[0] = 0;
                     sendBuffer[1] = TFTP_ACK;
-                    memcpy(sendBuffer+2, currentBlock, sizeof(currentBlock));
-                    // sendBuffer[2] = (uint8_t) currentBlock >> 8;
-                    // sendBuffer[3] = (uint8_t) currentBlock;
+                    sendBuffer[2] = currentBlock >> 8;
+                    sendBuffer[3] = currentBlock & 0x00FF;
                     sendLength = 4;
                     sent = sendto(sock, sendBuffer, sendLength, 0,
                                   (struct sockaddr *)&server, server_len);
 
-                    printf("ACK contained: %d%d %d%d\n", sendBuffer[0],
-                           sendBuffer[1], sendBuffer[2], sendBuffer[3]);
+                    // printf("\033[1A\n\rACK contained: %d%d %d%d\n\033[1B",
+                    //        sendBuffer[0], sendBuffer[1], sendBuffer[2],
+                    //        sendBuffer[3]);
 
                     currentBlock++;
 
                     printf("\r%s[", ESC_WHITE_TXT);
                     for (int i = 0; i < MAX_BLOCKS/819; i++)
                     {
-                        if (currentBlock/819 >= i)
+                        if (currentBlock*11/819 >= i)
                         {
                             printf("%s=%s", ESC_GREEN_TXT, ESC_WHITE_TXT);
                         }
@@ -309,9 +314,9 @@ int main(int argc, char** argv)
                        ESC_WHITE_TXT);
                 break;
             }            
-        // }
+        }
 
-    } while (received >= MAX_BLOCK_SIZE);
+    } while (received-4 >= MAX_BLOCK_SIZE);
 
     printf("\r%s[", ESC_WHITE_TXT);
     for (int i = 0; i < MAX_BLOCKS/819; i++)
